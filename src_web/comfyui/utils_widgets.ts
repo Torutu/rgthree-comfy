@@ -2,6 +2,7 @@ import type {
   LGraphNode,
   LGraphCanvas as TLGraphCanvas,
   Vector2,
+  IBaseWidget,
   ICustomWidget,
   IWidgetOptions,
   CanvasPointerEvent,
@@ -42,6 +43,34 @@ export function drawLabelAndValue(
   ctx.fillText(fitString(ctx, value, valueXRight - valueXLeft), valueXRight, midY);
   ctx.restore();
 }
+
+/**
+ * Repaints a node's widgets in whichever renderer is active.
+ *
+ * - Classic LiteGraph canvas: every node shares one <canvas>; marking it dirty repaints everything.
+ * - Nodes 2.0 (Vue nodes): ComfyUI's `WidgetLegacy` component gives each canvas-drawn widget its own
+ *   <canvas> and only repaints it on mount, resize, palette change, or when `widget.triggerDraw()` is
+ *   called. ComfyUI calls `triggerDraw` on every widget of a node after one of its own Vue widgets
+ *   changes a value; rgthree widgets change values themselves, so they must do the same.
+ *
+ * @param widgets Only repaint these (Nodes 2.0). Defaults to all of the node's widgets.
+ */
+export function redrawNodeWidgets(node: LGraphNode, widgets?: (IBaseWidget | null | undefined)[]) {
+  for (const widget of widgets ?? node.widgets ?? []) {
+    // rgthree widgets repaint every canvas they're shown on (the node, and the side panel when the
+    // node is selected); ComfyUI's single `triggerDraw` hook only reaches the copy mounted last.
+    if (widget instanceof Object && "redrawOwnCanvases" in widget) {
+      if ((widget as unknown as RgthreeBaseWidget<any>).redrawOwnCanvases(node)) continue;
+    }
+    (widget as {triggerDraw?: () => void} | null | undefined)?.triggerDraw?.();
+  }
+  if (node.graph) {
+    node.setDirtyCanvas(true, true);
+  }
+}
+
+/** Nodes 2.0 widget canvases we already listen to, mapped to the widget drawn on each. */
+const OWN_CANVAS_WIDGETS = new WeakMap<HTMLCanvasElement, RgthreeBaseWidget<any>>();
 
 export type RgthreeBaseWidgetBounds = {
   /** The bounds, either [x, width] assuming the full height, or [x, y, width, height] if height. */
@@ -127,7 +156,16 @@ export abstract class RgthreeBaseWidget<V extends ICustomWidget["value"]> implem
   }
 
   mouse(event: CanvasPointerEvent, pos: Vector2, node: LGraphNode) {
-    const canvas = app.canvas as TLGraphCanvas;
+    // Only the primary button interacts. The classic canvas sends right-clicks to its context menu,
+    // but Nodes 2.0 forwards every button here; without this a right-click acted like a click.
+    if (event.type == "pointerdown" && (event as PointerEvent).button > 0) {
+      return false;
+    }
+    const target = (event as unknown as Event).target;
+    if (event.type == "pointerdown" && target instanceof HTMLCanvasElement) {
+      this.useCanvas(target);
+    }
+    pos = this.toNodeSpace(event, pos);
 
     if (event.type == "pointerdown") {
       this.mouseDowned = [...pos] as Vector2;
@@ -209,6 +247,161 @@ export abstract class RgthreeBaseWidget<V extends ICustomWidget["value"]> implem
     return false;
   }
 
+  /**
+   * Converts a pointer position to the node space this class has always used (x from the node's
+   * left edge; this widget's row starts at `last_y`).
+   *
+   * On the classic canvas LiteGraph already passes node space, so nothing changes. In Nodes 2.0 the
+   * event comes from this widget's own small <canvas>, and ComfyUI passes canvas-local positions for
+   * down/move but graph-derived ones for pointerup; `offsetX/offsetY` on the event are exact for all
+   * three, so use them.
+   */
+  protected toNodeSpace(event: CanvasPointerEvent, pos: Vector2): Vector2 {
+    const target = (event as unknown as Event).target;
+    if (target instanceof HTMLCanvasElement && target !== app.canvas?.canvas) {
+      return [event.offsetX, (this.last_y || 0) + event.offsetY];
+    }
+    return pos;
+  }
+
+  /**
+   * Nodes 2.0 only: the cursor to show at a widget-local position. ComfyUI gives every canvas-drawn
+   * widget `class="cursor-crosshair"`, which suggests "connect" rather than "click". Return "" to
+   * keep ComfyUI's cursor.
+   */
+  getCursorAt(x: number, y: number): string {
+    return "";
+  }
+
+  /** Nodes 2.0 only: the pointer moved over this widget's canvas with no button pressed. */
+  protected onOwnCanvasHover(canvas: HTMLCanvasElement, x: number | null, y: number | null) {
+    canvas.style.cursor = x == null || y == null ? "" : this.getCursorAt(x, y);
+  }
+
+  /** Nodes 2.0 only: the user right-clicked this widget's canvas (ComfyUI then opens its menu). */
+  protected onOwnCanvasContextMenu(event: MouseEvent) {}
+
+  /** Nodes 2.0 only: the zoom the widget's canvas was last drawn at (see `fitOwnCanvas`). */
+  protected ownCanvasScale = 1;
+
+  /**
+   * Nodes 2.0 only: every canvas this widget is shown on, with the height and node it was drawn
+   * with. Selecting a node shows a second copy of its widgets in the side panel; ComfyUI's
+   * `triggerDraw` hook is one property per widget, so it ends up repainting only that copy.
+   */
+  private ownCanvases = new Map<HTMLCanvasElement, {height: number; node: LGraphNode}>();
+  /** The canvas drawn last. Hit areas are laid out for its width. */
+  private lastDrawnCanvas: HTMLCanvasElement | null = null;
+  /** The canvas the pointer is on; drawn last so its layout is the one hit areas use. */
+  private activeCanvas: HTMLCanvasElement | null = null;
+
+  /** Draws this widget onto one of its Nodes 2.0 canvases (draw() re-fits the canvas itself). */
+  protected drawOnOwnCanvas(canvas: HTMLCanvasElement) {
+    const entry = this.ownCanvases.get(canvas);
+    const ctx = canvas.getContext("2d");
+    if (!entry || !ctx) return;
+    const width = canvas.getBoundingClientRect().width || canvas.clientWidth;
+    (this as unknown as {draw?: Function}).draw?.(ctx, entry.node, width, 1, entry.height);
+  }
+
+  /**
+   * Repaints every canvas this widget is shown on, the one under the pointer last. Returns false
+   * when there are none yet (classic canvas, or not mounted), so callers can fall back.
+   */
+  redrawOwnCanvases(node: LGraphNode): boolean {
+    let any = false;
+    for (const canvas of [...this.ownCanvases.keys()]) {
+      if (!canvas.isConnected) {
+        this.ownCanvases.delete(canvas);
+        if (this.activeCanvas === canvas) this.activeCanvas = null;
+      }
+    }
+    for (const canvas of this.ownCanvases.keys()) {
+      if (canvas === this.activeCanvas) continue;
+      this.drawOnOwnCanvas(canvas);
+      any = true;
+    }
+    if (this.activeCanvas) {
+      this.drawOnOwnCanvas(this.activeCanvas);
+      any = true;
+    }
+    return any;
+  }
+
+  /** Before handling the pointer on a canvas, make sure hit areas are laid out for that canvas. */
+  private useCanvas(canvas: HTMLCanvasElement) {
+    this.activeCanvas = canvas;
+    if (this.lastDrawnCanvas !== canvas && this.ownCanvases.has(canvas)) {
+      this.drawOnOwnCanvas(canvas);
+    }
+  }
+
+  /**
+   * Call first thing in `draw()`; draw with the width it returns.
+   *
+   * Nodes 2.0 sizes each widget canvas from `getBoundingClientRect()`, i.e. in *screen* pixels, so
+   * at any zoom other than 100% the drawing (screen pixels), the canvas' height (derived from its
+   * bitmap's aspect ratio) and pointer positions (`offsetX`, unzoomed pixels) all disagree: rows grew
+   * or shrank against the node and clicks missed what was drawn. This resizes the canvas so one
+   * drawing unit is one unzoomed pixel at any zoom, keeping the bitmap sharp for the current zoom.
+   * On the classic canvas it changes nothing and returns `w`.
+   */
+  protected fitOwnCanvas(
+    ctx: CanvasRenderingContext2D,
+    w: number,
+    height: number,
+    node: LGraphNode,
+  ): number {
+    this.trackOwnCanvas(ctx);
+    const canvas = ctx.canvas;
+    if (!(canvas instanceof HTMLCanvasElement) || canvas === app.canvas?.canvas) return w;
+    this.ownCanvases.set(canvas, {height, node});
+    this.lastDrawnCanvas = canvas;
+    const layoutWidth = canvas.clientWidth;
+    if (!layoutWidth || !w) return w;
+    const scale = w / layoutWidth; // `w` is the on-screen width ComfyUI measured.
+    const density = 2 * scale; // ComfyUI draws these canvases at 2x.
+    const cssHeight = height + 2; // The height ComfyUI's own sizing gives at 100%.
+    canvas.style.height = `${cssHeight}px`;
+    canvas.width = Math.max(1, Math.round(layoutWidth * density));
+    canvas.height = Math.max(1, Math.round(cssHeight * density));
+    ctx.setTransform(density, 0, 0, density, 0, 0);
+    ctx.font = (app.canvas as TLGraphCanvas | undefined)?.inner_text_font || ctx.font;
+    this.ownCanvasScale = scale;
+    return layoutWidth;
+  }
+
+  /**
+   * Call from `draw()` (`fitOwnCanvas` does). When the widget is drawn on its own Nodes 2.0 canvas,
+   * listens to that canvas once (cursor + hover + right-click). Does nothing on the classic canvas.
+   */
+  protected trackOwnCanvas(ctx: CanvasRenderingContext2D) {
+    const canvas = ctx.canvas;
+    if (!(canvas instanceof HTMLCanvasElement) || canvas === app.canvas?.canvas) return;
+    const known = OWN_CANVAS_WIDGETS.has(canvas);
+    OWN_CANVAS_WIDGETS.set(canvas, this);
+    if (known) return;
+    canvas.addEventListener("pointermove", (e: PointerEvent) => {
+      if (e.buttons) return; // Dragging: keep the cursor the press started with.
+      const widget = OWN_CANVAS_WIDGETS.get(canvas);
+      if (!widget) return;
+      // Zooming doesn't repaint (the canvas' layout size doesn't change), so the bitmap gets
+      // stretched. Repaint once at the new zoom when the pointer comes by, to keep it sharp.
+      const scale = canvas.getBoundingClientRect().width / (canvas.clientWidth || 1);
+      if (Math.abs(scale / widget.ownCanvasScale - 1) > 0.15) {
+        widget.lastDrawnCanvas = null; // Forces useCanvas() to repaint this canvas.
+      }
+      widget.useCanvas(canvas);
+      widget.onOwnCanvasHover(canvas, e.offsetX, e.offsetY);
+    });
+    canvas.addEventListener("pointerleave", () => {
+      OWN_CANVAS_WIDGETS.get(canvas)?.onOwnCanvasHover(canvas, null, null);
+    });
+    canvas.addEventListener("contextmenu", (e: MouseEvent) => {
+      OWN_CANVAS_WIDGETS.get(canvas)?.onOwnCanvasContextMenu(e);
+    });
+  }
+
   /** Sometimes we want to cancel a mouse down, so that an up/move aren't fired. */
   cancelMouseDown() {
     this.mouseDowned = null;
@@ -272,12 +465,17 @@ export class RgthreeBetterButtonWidget extends RgthreeBaseWidget<string> {
   }
 
   draw(ctx: CanvasRenderingContext2D, node: LGraphNode, width: number, y: number, height: number) {
+    width = this.fitOwnCanvas(ctx, width, height, node);
     drawWidgetButton(
       ctx,
       {size: [width - 30, height], pos: [15, y]},
       this.label,
       this.isMouseDownedAndOver,
     );
+  }
+
+  override getCursorAt(x: number, y: number) {
+    return "pointer";
   }
 
   override onMouseClick(event: CanvasPointerEvent, pos: Vector2, node: LGraphNode) {
@@ -350,6 +548,7 @@ export class RgthreeDividerWidget extends RgthreeBaseWidget<{}> {
   }
 
   draw(ctx: CanvasRenderingContext2D, node: LGraphNode, width: number, posY: number, h: number) {
+    width = this.fitOwnCanvas(ctx, width, h, node);
     if (this.widgetOptions.thickness) {
       ctx.strokeStyle = this.widgetOptions.color;
       const x = this.widgetOptions.marginLeft;

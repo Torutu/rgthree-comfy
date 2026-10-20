@@ -18,6 +18,21 @@ export function drawLabelAndValue(ctx, label, value, width, posY, height, option
     ctx.fillText(fitString(ctx, value, valueXRight - valueXLeft), valueXRight, midY);
     ctx.restore();
 }
+export function redrawNodeWidgets(node, widgets) {
+    var _a;
+    var _b;
+    for (const widget of (_b = widgets !== null && widgets !== void 0 ? widgets : node.widgets) !== null && _b !== void 0 ? _b : []) {
+        if (widget instanceof Object && "redrawOwnCanvases" in widget) {
+            if (widget.redrawOwnCanvases(node))
+                continue;
+        }
+        (_a = widget === null || widget === void 0 ? void 0 : widget.triggerDraw) === null || _a === void 0 ? void 0 : _a.call(widget);
+    }
+    if (node.graph) {
+        node.setDirtyCanvas(true, true);
+    }
+}
+const OWN_CANVAS_WIDGETS = new WeakMap();
 export class RgthreeBaseWidget {
     constructor(name) {
         this.type = "custom";
@@ -30,6 +45,10 @@ export class RgthreeBaseWidget {
         this.hitAreas = {};
         this.downedHitAreasForMove = [];
         this.downedHitAreasForClick = [];
+        this.ownCanvasScale = 1;
+        this.ownCanvases = new Map();
+        this.lastDrawnCanvas = null;
+        this.activeCanvas = null;
         this.name = name;
     }
     serializeValue(node, index) {
@@ -46,7 +65,14 @@ export class RgthreeBaseWidget {
     }
     mouse(event, pos, node) {
         var _a, _b, _c;
-        const canvas = app.canvas;
+        if (event.type == "pointerdown" && event.button > 0) {
+            return false;
+        }
+        const target = event.target;
+        if (event.type == "pointerdown" && target instanceof HTMLCanvasElement) {
+            this.useCanvas(target);
+        }
+        pos = this.toNodeSpace(event, pos);
         if (event.type == "pointerdown") {
             this.mouseDowned = [...pos];
             this.isMouseDownedAndOver = true;
@@ -118,6 +144,110 @@ export class RgthreeBaseWidget {
         }
         return false;
     }
+    toNodeSpace(event, pos) {
+        var _a;
+        const target = event.target;
+        if (target instanceof HTMLCanvasElement && target !== ((_a = app.canvas) === null || _a === void 0 ? void 0 : _a.canvas)) {
+            return [event.offsetX, (this.last_y || 0) + event.offsetY];
+        }
+        return pos;
+    }
+    getCursorAt(x, y) {
+        return "";
+    }
+    onOwnCanvasHover(canvas, x, y) {
+        canvas.style.cursor = x == null || y == null ? "" : this.getCursorAt(x, y);
+    }
+    onOwnCanvasContextMenu(event) { }
+    drawOnOwnCanvas(canvas) {
+        var _a, _b;
+        const entry = this.ownCanvases.get(canvas);
+        const ctx = canvas.getContext("2d");
+        if (!entry || !ctx)
+            return;
+        const width = canvas.getBoundingClientRect().width || canvas.clientWidth;
+        (_b = (_a = this).draw) === null || _b === void 0 ? void 0 : _b.call(_a, ctx, entry.node, width, 1, entry.height);
+    }
+    redrawOwnCanvases(node) {
+        let any = false;
+        for (const canvas of [...this.ownCanvases.keys()]) {
+            if (!canvas.isConnected) {
+                this.ownCanvases.delete(canvas);
+                if (this.activeCanvas === canvas)
+                    this.activeCanvas = null;
+            }
+        }
+        for (const canvas of this.ownCanvases.keys()) {
+            if (canvas === this.activeCanvas)
+                continue;
+            this.drawOnOwnCanvas(canvas);
+            any = true;
+        }
+        if (this.activeCanvas) {
+            this.drawOnOwnCanvas(this.activeCanvas);
+            any = true;
+        }
+        return any;
+    }
+    useCanvas(canvas) {
+        this.activeCanvas = canvas;
+        if (this.lastDrawnCanvas !== canvas && this.ownCanvases.has(canvas)) {
+            this.drawOnOwnCanvas(canvas);
+        }
+    }
+    fitOwnCanvas(ctx, w, height, node) {
+        var _a, _b;
+        this.trackOwnCanvas(ctx);
+        const canvas = ctx.canvas;
+        if (!(canvas instanceof HTMLCanvasElement) || canvas === ((_a = app.canvas) === null || _a === void 0 ? void 0 : _a.canvas))
+            return w;
+        this.ownCanvases.set(canvas, { height, node });
+        this.lastDrawnCanvas = canvas;
+        const layoutWidth = canvas.clientWidth;
+        if (!layoutWidth || !w)
+            return w;
+        const scale = w / layoutWidth;
+        const density = 2 * scale;
+        const cssHeight = height + 2;
+        canvas.style.height = `${cssHeight}px`;
+        canvas.width = Math.max(1, Math.round(layoutWidth * density));
+        canvas.height = Math.max(1, Math.round(cssHeight * density));
+        ctx.setTransform(density, 0, 0, density, 0, 0);
+        ctx.font = ((_b = app.canvas) === null || _b === void 0 ? void 0 : _b.inner_text_font) || ctx.font;
+        this.ownCanvasScale = scale;
+        return layoutWidth;
+    }
+    trackOwnCanvas(ctx) {
+        var _a;
+        const canvas = ctx.canvas;
+        if (!(canvas instanceof HTMLCanvasElement) || canvas === ((_a = app.canvas) === null || _a === void 0 ? void 0 : _a.canvas))
+            return;
+        const known = OWN_CANVAS_WIDGETS.has(canvas);
+        OWN_CANVAS_WIDGETS.set(canvas, this);
+        if (known)
+            return;
+        canvas.addEventListener("pointermove", (e) => {
+            if (e.buttons)
+                return;
+            const widget = OWN_CANVAS_WIDGETS.get(canvas);
+            if (!widget)
+                return;
+            const scale = canvas.getBoundingClientRect().width / (canvas.clientWidth || 1);
+            if (Math.abs(scale / widget.ownCanvasScale - 1) > 0.15) {
+                widget.lastDrawnCanvas = null;
+            }
+            widget.useCanvas(canvas);
+            widget.onOwnCanvasHover(canvas, e.offsetX, e.offsetY);
+        });
+        canvas.addEventListener("pointerleave", () => {
+            var _a;
+            (_a = OWN_CANVAS_WIDGETS.get(canvas)) === null || _a === void 0 ? void 0 : _a.onOwnCanvasHover(canvas, null, null);
+        });
+        canvas.addEventListener("contextmenu", (e) => {
+            var _a;
+            (_a = OWN_CANVAS_WIDGETS.get(canvas)) === null || _a === void 0 ? void 0 : _a.onOwnCanvasContextMenu(e);
+        });
+    }
     cancelMouseDown() {
         this.mouseDowned = null;
         this.isMouseDownedAndOver = false;
@@ -146,7 +276,11 @@ export class RgthreeBetterButtonWidget extends RgthreeBaseWidget {
         this.label = label || name;
     }
     draw(ctx, node, width, y, height) {
+        width = this.fitOwnCanvas(ctx, width, height, node);
         drawWidgetButton(ctx, { size: [width - 30, height], pos: [15, y] }, this.label, this.isMouseDownedAndOver);
+    }
+    getCursorAt(x, y) {
+        return "pointer";
     }
     onMouseClick(event, pos, node) {
         return this.mouseClickCallback(event, pos, node);
@@ -190,6 +324,7 @@ export class RgthreeDividerWidget extends RgthreeBaseWidget {
         Object.assign(this.widgetOptions, widgetOptions || {});
     }
     draw(ctx, node, width, posY, h) {
+        width = this.fitOwnCanvas(ctx, width, h, node);
         if (this.widgetOptions.thickness) {
             ctx.strokeStyle = this.widgetOptions.color;
             const x = this.widgetOptions.marginLeft;
